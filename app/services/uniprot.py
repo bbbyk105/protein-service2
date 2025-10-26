@@ -3,6 +3,7 @@ UniProt API Service
 
 Fetch protein information and PDB cross-references from UniProt REST API
 """
+
 import requests
 from typing import Dict, List, Optional, Tuple
 from app.util import backoff
@@ -21,10 +22,10 @@ def _get(url, timeout=15):
 def fetch_uniprot_core(uniprot_id: str) -> Optional[Dict]:
     """
     Fetch core protein information from UniProt
-    
+
     Args:
         uniprot_id: UniProt accession ID
-        
+
     Returns:
         Dict with id, name, length, organism or None if not found
     """
@@ -33,34 +34,34 @@ def fetch_uniprot_core(uniprot_id: str) -> Optional[Dict]:
         r = _get(url)
     except Exception:
         return None
-        
+
     if r.status_code != 200:
         return None
-        
+
     try:
         j = r.json()
     except Exception:
         return None
-    
+
     # Extract protein name
     name = None
     try:
-        name = j.get("proteinDescription", {}).get("recommendedName", {}).get("fullName", {}).get("value")
+        name = (
+            j.get("proteinDescription", {})
+            .get("recommendedName", {})
+            .get("fullName", {})
+            .get("value")
+        )
     except Exception:
         pass
-    
+
     # Extract sequence length
     length = j.get("sequence", {}).get("length")
-    
+
     # Extract organism
     organism = j.get("organism", {}).get("scientificName")
-    
-    return {
-        "id": uniprot_id,
-        "name": name,
-        "length": length,
-        "organism": organism
-    }
+
+    return {"id": uniprot_id, "name": name, "length": length, "organism": organism}
 
 
 def fetch_pdb_ids(
@@ -71,13 +72,13 @@ def fetch_pdb_ids(
 ) -> List[str]:
     """
     Fetch PDB IDs from UniProt cross-references
-    
+
     Args:
         uniprot_id: UniProt accession ID
         method: Experimental method (X-ray, EM, NMR) - case insensitive
         max_pdb: Maximum number of PDB IDs to return
         max_resolution: Maximum resolution in Angstroms (None for no limit)
-        
+
     Returns:
         List of PDB IDs sorted by resolution (best first)
     """
@@ -86,48 +87,49 @@ def fetch_pdb_ids(
         r = _get(url)
     except Exception:
         return []
-        
+
     if r.status_code != 200:
         return []
-        
+
     try:
         j = r.json()
     except Exception:
         return []
-    
+
     xrefs = j.get("uniProtKBCrossReferences", [])
-    
+
     items: List[Tuple[str, float]] = []
-    
+
     for x in xrefs:
         if x.get("database") != "PDB":
             continue
-            
+
         pid = x.get("id")
         if not pid:
             continue
-        
+
         # Extract properties
         props = {p["key"]: p.get("value") for p in x.get("properties", [])}
-        
+
         # Check method
         meth = (props.get("Method") or props.get("method") or "").lower()
         if method and meth and meth != method.lower():
             continue
-        
+
         # Extract resolution
         res_str = props.get("Resolution") or props.get("resolution") or ""
         try:
             res = float(res_str.replace("Å", "").replace("A", "").strip())
         except Exception:
             res = 99.9
-        
-        # Filter by resolution
-        if (max_resolution is not None) and (res > max_resolution):
-            continue
-        
+
+        # Filter by resolution (NMRはスキップ)
+        if meth != "nmr":
+            if (max_resolution is not None) and (res > max_resolution):
+                continue
+
         items.append((pid[:4].upper(), res))
-    
+
     # Sort by resolution and deduplicate
     seen = set()
     unique = []
@@ -137,5 +139,5 @@ def fetch_pdb_ids(
             unique.append(pid)
         if len(unique) >= max_pdb:
             break
-    
+
     return unique
