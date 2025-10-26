@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from Bio.PDB import MMCIFParser, PPBuilder, is_aa
 from Bio.PDB.vectors import calc_dihedral
+from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 
 
 # ─── 保存先を絶対パスに固定 ─────────────────────────────
@@ -36,6 +37,61 @@ def _ensure_dir(p: Path):
 
 
 # ─── mmCIF読み込み ─────────────────────────────────────
+
+# 実験手法フィルタ用の対応表
+EXPTL_ALLOW = {
+    "X-ray": {"X-RAY DIFFRACTION"},
+    "NMR": {"SOLUTION NMR", "SOLID-STATE NMR"},
+    "EM": {"ELECTRON MICROSCOPY", "ELECTRON CRYOMICROSCOPY"},
+}
+
+
+def _get_exptl_method(cif_path: str) -> str:
+    """
+    _exptl.method を堅牢に取得（複数行/ループ対応）
+    """
+    try:
+        d = MMCIF2Dict(cif_path)
+        exps = d.get("_exptl.method", [])
+        if isinstance(exps, str):
+            exps = [exps]
+        exps = [e.upper() for e in exps if isinstance(e, str)]
+        # ひとつでも許可された実験法があれば返す（なければ空）
+        return ";".join(exps)
+    except Exception:
+        return ""
+
+
+def _filter_cifs_by_method(cif_paths: List[str], method: str) -> List[str]:
+    """
+    実験手法でCIFファイルをフィルタ
+    
+    Args:
+        cif_paths: mmCIFファイルのパスリスト
+        method: 期待する実験手法 ("X-ray", "NMR", "EM")
+        
+    Returns:
+        フィルタ済みのパスリスト
+    """
+    if not method or method not in EXPTL_ALLOW:
+        # methodが指定されていない、または不明な場合は全て通す
+        return cif_paths
+    
+    allowed_methods = EXPTL_ALLOW[method]
+    filtered = []
+    
+    for cif_path in cif_paths:
+        exptl = _get_exptl_method(cif_path)
+        
+        # 部分一致でチェック（"ELECTRON MICROSCOPY"を"EM"で引っかける）
+        matched = any(allowed in exptl for allowed in allowed_methods)
+        
+        if matched:
+            filtered.append(cif_path)
+    
+    return filtered
+
+
 def _load_structures(cif_paths: List[str]):
     """
     mmCIFファイルを読み込んで構造オブジェクトのリストを返す
@@ -64,6 +120,39 @@ def _collect_residues(struct) -> List:
                     residues.append(res)
         break  # 1モデルのみ
     return residues
+
+
+def _collect_residues_primary_chain(struct):
+    """
+    構造から「最長の標準アミノ酸チェーン」1本だけを返す（1モデルのみ）
+    多量体の重複カウントを防ぐため
+    """
+    best = None
+    best_len = 0
+    for model in struct:           # 1モデルのみ扱う前提
+        for chain in model:
+            residues = [res for res in chain if is_aa(res, standard=True)]
+            if len(residues) > best_len:
+                best = residues
+                best_len = len(residues)
+        break  # 1モデルのみ
+    return best or []
+
+
+def _kmer_signature(residues: List, j: int, k: int = 2) -> str:
+    """
+    PRO（j）を中心に ±k の3文字残基名を連結してシグネチャ化
+    例: GLY-THR-ASP-PRO-TYR
+    PDB間で番号が揺れても配列は同じなので同一サイトは1つにまとまる
+    """
+    names = []
+    for off in range(-k, k + 1):
+        idx = j + off
+        if 0 <= idx < len(residues):
+            names.append(_resname(residues[idx]).upper())
+        else:
+            names.append("OUT")
+    return "-".join(names)
 
 
 def _resname(res) -> str:
@@ -104,74 +193,59 @@ def _dihedral(a, b, c, d) -> float | None:
         if ang > 180:
             ang -= 360
         return ang
-    except Exception as e:
-        # デバッグ: 初回のみエラーを表示
-        if not hasattr(_dihedral, '_error_shown'):
-            print(f"  [DEBUG] _dihedral error: {type(e).__name__}: {e}")
-            _dihedral._error_shown = True
+    except Exception:
         return None
 
 
 # ─── 解析：cis結合検出 & Cα距離 ─────────────────────────────
 def _detect_cis(residues: List) -> List[Tuple[int, int, float, str]]:
     """
-    ペプチド結合のcis形式を検出
-    
-    ω角（omega）が-30°～30°の範囲をcisと判定
-    ノートブックの`run_DSA`関数のロジックを移植
-    
-    Returns:
-        List of (res_i, res_j, omega_deg, resname_j)
+    ペプチド結合の cis 検出（ハイブリッドアプローチ）
+    - ω1: C(i)-N(i+1)-CA(i+1)-C(i+1) （正統、優先）
+    - ω2: CA(i)-C(i)-N(i+1)-CA(i+1) （補助、ω1で検出できない場合のみ）
+    - cis: |ω| <= 20°
+    - C-N距離: 1.2-1.6 Å
+    戻り値: [(i, i+1, omega_deg, resname_j)]
     """
     out = []
-    omega_all = []  # デバッグ用: 全てのω角
-    
+    TH = 20.0  # 厳しめ
+
     for i in range(len(residues) - 1):
-        r_i = residues[i]
-        r_ip1 = residues[i + 1]
-        
-        # ω角の正しい定義: CA(i) - C(i) - N(i+1) - CA(i+1)
-        CA_i = _atom(r_i, "CA")
+        r_i, r_ip1 = residues[i], residues[i + 1]
+
+        # 同一チェーンのみ
+        ch_i = r_i.get_parent().id if r_i.get_parent() else None
+        ch_ip1 = r_ip1.get_parent().id if r_ip1.get_parent() else None
+        if ch_i != ch_ip1:
+            continue
+
         C_i = _atom(r_i, "C")
+        CA_i = _atom(r_i, "CA")
         N_ip1 = _atom(r_ip1, "N")
         CA_ip1 = _atom(r_ip1, "CA")
-        
-        if CA_i is None or C_i is None or N_ip1 is None or CA_ip1 is None:
+        C_ip1 = _atom(r_ip1, "C")
+        if any(x is None for x in (C_i, CA_i, N_ip1, CA_ip1, C_ip1)):
             continue
-        
-        omega = _dihedral(CA_i, C_i, N_ip1, CA_ip1)
-        if omega is None:
+
+        # C-N 距離ガード（やや緩め）
+        try:
+            d_CN = float(np.linalg.norm(C_i.get_coord() - N_ip1.get_coord()))
+        except Exception:
             continue
-        
-        omega_all.append(omega)
-        
-        # cis判定: -30° <= ω <= 30°
-        if -30.0 <= omega <= 30.0:
-            out.append((i, i + 1, float(omega), _resname(r_ip1)))
-    
-    # デバッグ出力
-    print(f"  [DEBUG] Total ω angles calculated: {len(omega_all)}")
-    if omega_all:
-        import numpy as np
-        print(f"  [DEBUG] ω range: {np.min(omega_all):.1f}° to {np.max(omega_all):.1f}°")
-        cis_count = sum(1 for w in omega_all if -30 <= w <= 30)
-        trans_count = sum(1 for w in omega_all if abs(abs(w) - 180) < 30)
-        print(f"  [DEBUG] cis-like: {cis_count}, trans-like: {trans_count}")
-        
-        # 詳細: 異常なω角を表示（通常はtrans: 180°付近、cis: 0°付近のみ）
-        unusual = [w for w in omega_all if not (-30 <= w <= 30 or 150 <= abs(w) <= 180)]
-        if unusual:
-            print(f"  [DEBUG] Unusual ω angles (not cis/trans): {sorted(unusual)[:10]}")
-        
-        # Pro残基の前のω角を特定
-        pro_omegas = []
-        for i, (res_i, res_j, omega_val, resname_j) in enumerate([(i, i+1, omega_all[i] if i < len(omega_all) else None, _resname(residues[i+1])) for i in range(min(len(residues)-1, len(omega_all)))]):
-            if resname_j == "PRO" and omega_val is not None:
-                pro_omegas.append((res_j, omega_val))
-        
-        if pro_omegas:
-            print(f"  [DEBUG] Pro residues ω angles: {pro_omegas[:5]}")
-    
+        if not (1.2 <= d_CN <= 1.6):
+            continue
+
+        # ω1（正統）を優先
+        w1 = _dihedral(C_i, N_ip1, CA_ip1, C_ip1)
+        if w1 is not None and -TH <= w1 <= TH:
+            out.append((i, i + 1, float(w1), _resname(r_ip1)))
+            continue
+
+        # ω1で検出できない場合のみω2を試す（補助的）
+        w2 = _dihedral(CA_i, C_i, N_ip1, CA_ip1)
+        if w2 is not None and -TH <= w2 <= TH:
+            out.append((i, i + 1, float(w2), _resname(r_ip1)))
+
     return out
 
 
@@ -323,24 +397,41 @@ def analyze_structures(
     outdir = ART_ROOT / uniprot_id
     _ensure_dir(outdir)
     
-    # 構造ファイル読み込み
-    structs = _load_structures(cif_paths)
+    # 🔧 FIX 1: methodフィルタを適用
+    filtered_cif_paths = _filter_cifs_by_method(cif_paths, method)
+    
+    # 🔧 FIX 2: 構造ファイルが0件のときは早期return
+    if not filtered_cif_paths:
+        return {
+            "uniprot_id": uniprot_id,
+            "method": method,
+            "seq_ratio": seq_ratio,
+            "pdb_ids": [],
+            "kpi": {"cis_count": 0, "midrange_dist_fraction": None},
+            "artifacts": {},
+            "note": f"No entries after method filter: {method}",
+            "ts": datetime.utcnow().isoformat() + "Z",
+        }
+    
+    # 構造ファイル読み込み（フィルタ済み）
+    structs = _load_structures(filtered_cif_paths)
     
     if not structs:
         return {
             "uniprot_id": uniprot_id,
             "method": method,
             "seq_ratio": seq_ratio,
+            "pdb_ids": [Path(p).stem for p in filtered_cif_paths],
             "kpi": {"cis_count": 0, "midrange_dist_fraction": None},
             "artifacts": {},
             "note": "No valid mmCIF parsed",
             "ts": datetime.utcnow().isoformat() + "Z",
         }
     
-    # 各構造から残基リストを抽出
+    # 各構造から残基リストを抽出（最長チェーンのみ - 重複防止）
     reslists = []
     for s in structs:
-        residues = _collect_residues(s)
+        residues = _collect_residues_primary_chain(s)
         
         # 計算量対策: 1200残基まで
         if len(residues) > 1200:
@@ -354,14 +445,23 @@ def analyze_structures(
             "uniprot_id": uniprot_id,
             "method": method,
             "seq_ratio": seq_ratio,
+            "pdb_ids": [Path(p).stem for p in filtered_cif_paths],
             "kpi": {"cis_count": 0, "midrange_dist_fraction": None},
             "artifacts": {},
             "note": "No valid residues found",
             "ts": datetime.utcnow().isoformat() + "Z",
         }
     
-    # cis結合検出（最初の構造のみ）
-    cis_list = _detect_cis(reslists[0])
+    # cis 検出（先頭構造のみ - 代表構造として使用）
+    cis_list = _detect_cis(reslists[0])  # [(i, j, omega, resname_j)]
+    
+    # Pro限定のcis数を計算（KPIの主要指標）
+    cis_count_pro = sum(1 for (_, _, _, resname) in cis_list if str(resname).upper() == "PRO")
+    cis_count_all = len(cis_list)
+    
+    # CSV出力用
+    cis_list_for_csv = cis_list
+
     
     # 各構造の距離行列を計算
     mats = []
@@ -375,9 +475,9 @@ def analyze_structures(
     
     # ─── アーティファクト生成 ───────────────────────
     
-    # 1. cis結合のCSV
+    # 1. cis結合のCSV（先頭構造のみ、互換性のため）
     cis_df = pd.DataFrame(
-        cis_list,
+        cis_list_for_csv,
         columns=["res_i", "res_j", "omega_deg", "resname_j"]
     )
     cis_csv = outdir / "cis.csv"
@@ -403,17 +503,20 @@ def analyze_structures(
     
     # 中距離割合（10-20Åの割合）
     with np.errstate(invalid="ignore"):
-        finite = meanD[np.isfinite(meanD)]
-        pct_mid = (
-            float(np.mean((finite >= 10.0) & (finite <= 20.0)))
-            if finite.size > 0
-            else None
-        )
+        if meanD.size == 0:
+            pct_mid = None
+        else:
+            finite = meanD[np.isfinite(meanD)]
+            pct_mid = (
+                float(np.mean((finite >= 10.0) & (finite <= 20.0)))
+                if finite.size > 0
+                else None
+            )
     
     # cis結合の平均距離とスコア（研究室の指標）
     cis_distances = []
-    if cis_list:
-        for res_i, res_j, omega, resname in cis_list:
+    if cis_list_for_csv:
+        for res_i, res_j, omega, resname in cis_list_for_csv:
             if res_i < meanD.shape[0] and res_j < meanD.shape[0]:
                 d = meanD[res_i, res_j]
                 if not np.isnan(d):
@@ -428,12 +531,14 @@ def analyze_structures(
         "uniprot_id": uniprot_id,
         "method": method,
         "seq_ratio": seq_ratio,
+        "pdb_ids": [Path(p).stem for p in filtered_cif_paths],
         "inputs": {
-            "pdb_cifs": [str(Path(p).name) for p in cif_paths],
+            "pdb_cifs": [str(Path(p).name) for p in filtered_cif_paths],
             "alphafold_models": len(alphafold),
         },
         "kpi": {
-            "cis_count": int(len(cis_list)),
+            "cis_count": int(cis_count_pro),  # Pro限定のcis数（先頭構造のみ）
+            "cis_count_all": int(cis_count_all),  # 全残基のcis数（先頭構造のみ）
             "midrange_dist_fraction": pct_mid,
             "mean_cis_distance": mean_cis_dist,
             "std_cis_distance": std_cis_dist,
