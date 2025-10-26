@@ -1,0 +1,20 @@
+# FastAPI & Server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+
+# Data Science
+numpy==1.26.4
+pandas==2.2.3
+biopython==1.84
+
+# Visualization
+matplotlib==3.9.2
+seaborn==0.13.2
+
+# HTTP
+requests==2.32.3
+lxml==5.3.0
+
+# Utilities
+python-multipart==0.0.12
