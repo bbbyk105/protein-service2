@@ -8,6 +8,8 @@ import re
 from typing import List, Optional, Union
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 from app.services.uniprot import fetch_uniprot_core, fetch_pdb_ids
@@ -32,6 +34,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+data_path = Path("data")
+if data_path.exists():
+    app.mount("/data", StaticFiles(directory="data"), name="data")
+else:
+    print("Warning: 'data' directory not found. Creating it...")
+    data_path.mkdir(parents=True, exist_ok=True)
+    app.mount("/data", StaticFiles(directory="data"), name="data")
 
 
 # ─── Models ────────────────────────────────────────────
@@ -223,6 +233,20 @@ def analyze(req: AnalyzeReq):
             }
 
         # 6. 結果格納
+        artifacts = analysis.get("artifacts", {})
+        normalized_artifacts = {}
+        for key, path in artifacts.items():
+            if isinstance(path, str) and ("/" in path or "\\" in path):
+                # 絶対パスから相対パスに変換
+                # /Users/.../protein-service/data/artifacts/... → data/artifacts/...
+                if "data/artifacts" in path:
+                    idx = path.find("data/artifacts")
+                    normalized_artifacts[key] = path[idx:]
+                else:
+                    normalized_artifacts[key] = path
+            else:
+                normalized_artifacts[key] = path
+
         out.append(
             {
                 "uniprot_id": uid,
@@ -230,7 +254,10 @@ def analyze(req: AnalyzeReq):
                 "pdb_ids": all_pdb_ids,
                 "methods": methods,
                 "alphafold_models": len(af_models),
-                "analysis": analysis,
+                "analysis": {
+                    **analysis,
+                    "artifacts": normalized_artifacts,  # 正規化されたパス
+                },
                 "status": "ok" if "error" not in analysis else "error",
             }
         )
